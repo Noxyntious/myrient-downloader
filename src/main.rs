@@ -34,6 +34,10 @@ struct MyrientApp {
     needs_directory_load: bool,
     selected_roms: HashSet<String>,
     search_term: String,
+    max_concurrent_downloads: usize,
+    download_queue: Vec<Rom>,
+    active_downloads: usize,
+    show_queue_window: bool,
 }
 
 async fn download_rom(
@@ -41,11 +45,10 @@ async fn download_rom(
     download_path: &Path,
     tx: std::sync::mpsc::Sender<AppUpdate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tx.send(AppUpdate::SetStatus(format!(
+    let _ = tx.send(AppUpdate::SetStatus(format!(
         "Starting download of {}",
         rom.filename
-    )))
-    .unwrap();
+    )));
 
     // Create client and get response
     let client = reqwest::Client::new();
@@ -60,12 +63,11 @@ async fn download_rom(
 
     if content_type.contains("text") {
         let text = response.text().await?;
-        tx.send(AppUpdate::SetStatus(format!(
+        let _ = tx.send(AppUpdate::SetStatus(format!(
             "Error: Received text response for {}, check console",
             rom.filename
-        )))
-        .unwrap();
-        println!("{}", text); // probably need to print allat
+        )));
+        println!("{}", text);
         return Err("Received text response instead of file".into());
     }
 
@@ -96,19 +98,16 @@ async fn download_rom(
             rom.filename,
             progress * 100.0
         );
-        tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), progress))
-            .unwrap();
+        let _ = tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), progress));
     }
 
     // Handle zip extraction if needed
+    // This probably doesn't work on Windows, but we don't like Windows anyways
     if dest.extension().unwrap_or_default() == "zip" {
-        tx.send(AppUpdate::SetStatus(format!("Extracting {}", rom.filename)))
-            .unwrap();
+        let _ = tx.send(AppUpdate::SetStatus(format!("Extracting {}", rom.filename)));
 
         let dest_dir = dest.with_extension("");
 
-        // Create unzip process
-        // This probably doesn't work on Windows, but we don't like Windows anyways
         let status = std::process::Command::new("unzip")
             .arg("-o") // overwrite files without prompting
             .arg(&dest)
@@ -117,11 +116,10 @@ async fn download_rom(
             .status()?;
 
         if !status.success() {
-            tx.send(AppUpdate::SetStatus(format!(
+            let _ = tx.send(AppUpdate::SetStatus(format!(
                 "Failed to extract {}",
                 rom.filename
-            )))
-            .unwrap();
+            )));
             return Err("Failed to unzip file".into());
         }
 
@@ -144,11 +142,10 @@ async fn download_rom(
                     .to_string();
                 let new_path = download_path.join(&entry_filename);
 
-                tx.send(AppUpdate::SetStatus(format!(
+                let _ = tx.send(AppUpdate::SetStatus(format!(
                     "Moving extracted file: {}",
                     entry_filename
-                )))
-                .unwrap();
+                )));
 
                 tokio::fs::copy(&entry_path, &new_path).await?;
             }
@@ -159,13 +156,11 @@ async fn download_rom(
     }
 
     // Signal completion
-    tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), -1.0))
-        .unwrap(); // Remove progress bar
-    tx.send(AppUpdate::SetStatus(format!(
+    let _ = tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), -1.0));
+    let _ = tx.send(AppUpdate::SetStatus(format!(
         "Successfully downloaded and processed {}",
         rom.filename
-    )))
-    .unwrap();
+    )));
 
     Ok(())
 }
@@ -198,7 +193,30 @@ impl Default for MyrientApp {
             needs_directory_load: true,
             selected_roms: HashSet::new(),
             search_term: String::new(),
+            max_concurrent_downloads: 8,
+            download_queue: Vec::new(),
+            active_downloads: 0,
+            show_queue_window: false,
         }
+    }
+}
+
+impl MyrientApp {
+    fn start_download(tx: std::sync::mpsc::Sender<AppUpdate>, rom: Rom, download_path: PathBuf) {
+        let _ = tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), 0.0));
+
+        std::thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = download_rom(&rom, &download_path, tx.clone()).await {
+                    let _ = tx.send(AppUpdate::SetStatus(format!(
+                        "Failed to download {}: {}",
+                        rom.filename, e
+                    )));
+                    let _ = tx.send(AppUpdate::DownloadProgress(rom.filename.clone(), -1.0));
+                }
+            });
+        });
     }
 }
 
@@ -213,6 +231,22 @@ impl eframe::App for MyrientApp {
                 AppUpdate::DownloadProgress(filename, progress) => {
                     if progress < 0.0 {
                         self.download_progress.remove(&filename);
+                        if self.active_downloads > 0 {
+                            self.active_downloads -= 1;
+                        }
+
+                        // Start next download from queue if any
+                        if !self.download_queue.is_empty() && !self.loading {
+                            let next_rom = self.download_queue.remove(0);
+                            self.download_progress
+                                .insert(next_rom.filename.clone(), 0.0);
+                            MyrientApp::start_download(
+                                self.tx.clone(),
+                                next_rom,
+                                PathBuf::from(&self.download_path),
+                            );
+                        }
+
                         if self.download_progress.is_empty() {
                             self.has_active_downloads = false;
                         }
@@ -489,30 +523,23 @@ impl eframe::App for MyrientApp {
                                 .collect();
 
                             for rom in selected_roms {
-                                let tx = self.tx.clone();
-                                let download_path = PathBuf::from(&self.download_path);
-
-                                self.download_progress.insert(rom.filename.clone(), 0.0);
-
-                                std::thread::spawn(move || {
-                                    let rt = Runtime::new().unwrap();
-                                    rt.block_on(async {
-                                        if let Err(e) =
-                                            download_rom(&rom, &download_path, tx.clone()).await
-                                        {
-                                            tx.send(AppUpdate::SetStatus(format!(
-                                                "Failed to download {}: {}",
-                                                rom.filename, e
-                                            )))
-                                            .unwrap();
-                                            tx.send(AppUpdate::DownloadProgress(
-                                                rom.filename.clone(),
-                                                -1.0,
-                                            ))
-                                            .unwrap();
-                                        }
-                                    });
-                                });
+                                if self.active_downloads < self.max_concurrent_downloads {
+                                    self.active_downloads += 1;
+                                    self.download_progress.insert(rom.filename.clone(), 0.0);
+                                    MyrientApp::start_download(
+                                        self.tx.clone(),
+                                        rom,
+                                        PathBuf::from(&self.download_path),
+                                    );
+                                } else {
+                                    self.download_queue.push(rom.clone());
+                                    self.tx
+                                        .send(AppUpdate::SetStatus(format!(
+                                            "Queued {} for download",
+                                            rom.filename
+                                        )))
+                                        .unwrap();
+                                }
                             }
                         }
                         ui.add_space(8.0);
@@ -578,36 +605,25 @@ impl eframe::App for MyrientApp {
                                                     .desired_width(100.0),
                                             );
                                         } else if ui.button("Download").clicked() && !self.loading {
-                                            let tx = self.tx.clone();
-                                            let rom = rom.clone();
-                                            let download_path = PathBuf::from(&self.download_path);
-
-                                            self.download_progress
-                                                .insert(rom.filename.clone(), 0.0);
-
-                                            std::thread::spawn(move || {
-                                                let rt = Runtime::new().unwrap();
-                                                rt.block_on(async {
-                                                    if let Err(e) = download_rom(
-                                                        &rom,
-                                                        &download_path,
-                                                        tx.clone(),
-                                                    )
-                                                    .await
-                                                    {
-                                                        tx.send(AppUpdate::SetStatus(format!(
-                                                            "Failed to download {}: {}",
-                                                            rom.filename, e
-                                                        )))
-                                                        .unwrap();
-                                                        tx.send(AppUpdate::DownloadProgress(
-                                                            rom.filename.clone(),
-                                                            -1.0,
-                                                        ))
-                                                        .unwrap();
-                                                    }
-                                                });
-                                            });
+                                            if self.active_downloads < self.max_concurrent_downloads
+                                            {
+                                                self.active_downloads += 1;
+                                                self.download_progress
+                                                    .insert(rom.filename.clone(), 0.0);
+                                                MyrientApp::start_download(
+                                                    self.tx.clone(),
+                                                    rom.clone(),
+                                                    PathBuf::from(&self.download_path),
+                                                );
+                                            } else {
+                                                self.download_queue.push(rom.clone());
+                                                self.tx
+                                                    .send(AppUpdate::SetStatus(format!(
+                                                        "Queued {} for download",
+                                                        rom.filename
+                                                    )))
+                                                    .unwrap();
+                                            }
                                         }
                                     },
                                 );
@@ -621,7 +637,67 @@ impl eframe::App for MyrientApp {
                     });
             });
         });
+        if self.show_queue_window {
+            egui::Window::new("Download Queue")
+                .open(&mut self.show_queue_window)
+                .resizable(true)
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    ui.heading("Active Downloads");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("active_downloads_scroll") // do this so it doesnt do Da Complainy
+                        .show(ui, |ui| {
+                            for (filename, progress) in &self.download_progress {
+                                ui.horizontal(|ui| {
+                                    ui.label(filename);
+                                    ui.add(
+                                        egui::ProgressBar::new(*progress)
+                                            .show_percentage()
+                                            .desired_width(100.0),
+                                    );
+                                });
+                            }
+                        });
 
+                    ui.heading(format!("Queued Downloads ({})", self.download_queue.len()));
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("queued_downloads_scroll")
+                        .show(ui, |ui| {
+                            let mut remove_indices = Vec::new();
+                            for (i, rom) in self.download_queue.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(&rom.filename);
+                                    if ui.button("❌").clicked() {
+                                        remove_indices.push(i);
+                                    }
+                                });
+                            }
+                            // Remove cancelled downloads
+                            for &i in remove_indices.iter().rev() {
+                                self.download_queue.remove(i);
+                            }
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Active Downloads: {}/{}",
+                            self.active_downloads, self.max_concurrent_downloads
+                        ));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Clear Queue").clicked() {
+                                self.download_queue.clear();
+                                let _ = self.tx.send(AppUpdate::SetStatus(
+                                    "Cleared download queue".to_string(),
+                                ));
+                            }
+                        });
+                    });
+                });
+        }
         // Show bottom status bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -631,6 +707,11 @@ impl eframe::App for MyrientApp {
                         env!("CARGO_PKG_VERSION"),
                         "0.1.0" // this is just a place holder until i figure out a better solution
                     ));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.button("📋 Queue").clicked() {
+                            self.show_queue_window = !self.show_queue_window;
+                        }
+                    });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.loading {
