@@ -4,6 +4,7 @@ use myrient_filter::{FilterOptions, Rom, RomLister};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
 
@@ -102,29 +103,40 @@ async fn download_rom(
     }
 
     // Handle zip extraction if needed
-    // This probably doesn't work on Windows, but we don't like Windows anyways
     if dest.extension().unwrap_or_default() == "zip" {
         let _ = tx.send(AppUpdate::SetStatus(format!("Extracting {}", rom.filename)));
 
         let dest_dir = dest.with_extension("");
+        fs::create_dir_all(&dest_dir).await?;
 
-        let status = std::process::Command::new("unzip")
-            .arg("-o") // overwrite files without prompting
-            .arg(&dest)
-            .arg("-d")
-            .arg(&dest_dir)
-            .status()?;
+        // Open and read the zip file synchronously (zip crate doesn't support async)
+        let zip_file = std::fs::File::open(&dest)?;
+        let mut archive = zip::ZipArchive::new(zip_file)?;
 
-        if !status.success() {
-            let _ = tx.send(AppUpdate::SetStatus(format!(
-                "Failed to extract {}",
-                rom.filename
-            )));
-            return Err("Failed to unzip file".into());
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let outpath = dest_dir.join(file.name());
+
+            if file.name().ends_with('/') {
+                fs::create_dir_all(&outpath).await?;
+            } else {
+                if let Some(p) = outpath.parent() {
+                    fs::create_dir_all(p).await?;
+                }
+
+                // Read the content
+                let mut contents = Vec::new();
+                std::io::copy(&mut file, &mut contents)?;
+
+                // Write asynchronously
+                let mut outfile = File::create(&outpath).await?;
+                outfile.write_all(&contents).await?;
+                outfile.flush().await?;
+            }
         }
 
         // Clean up zip file
-        tokio::fs::remove_file(&dest).await?;
+        fs::remove_file(&dest).await?;
 
         // Move extracted files to final location
         let filename_stripped = dest.file_stem().unwrap().to_str().unwrap();
